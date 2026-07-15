@@ -18,8 +18,10 @@ v6 변경 (무료 운영 구조 — 상시 리스너 제거):
 환경변수:
   TELEGRAM_BOT_TOKEN  : 봇 토큰
   TELEGRAM_CHAT_ID    : 본인 chat_id
-  ANTHROPIC_API_KEY   : Claude API 키 (기존 리서치 에이전트 키 재사용).
-                        미설정 시 AI 조사 4문항도 사용자 질문으로 전환 (8문항 응답)
+  GEMINI_API_KEY      : Gemini API 키 (무료, 기존 리서치 에이전트 키 재사용 —
+                        aistudio.google.com/apikey). AI 웹조사 5문항 담당
+  ANTHROPIC_API_KEY   : (선택) Claude API 키. GEMINI_API_KEY 부재 시 폴백.
+                        둘 다 없으면 AI 조사 5문항이 사용자 질문으로 전환 (9문항 응답)
   FRED_API_KEY        : (선택) 하이일드 스프레드. 없으면 자동 제외 후 가중 재배분
 
 의존성: pip install yfinance requests
@@ -42,7 +44,8 @@ except ImportError:
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 FRED_KEY = os.environ.get("FRED_API_KEY", "")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")        # 무료 (기존 리서치 에이전트 키 재사용)
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # 선택 (있으면 Gemini 부재 시 폴백)
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -307,13 +310,46 @@ def collect_auto():
 # ======================================================================
 # AI 웹조사 채점 (Claude API + web search)
 # ======================================================================
+def _ai_query_gemini(prompt):
+    """Gemini API (무료 티어) + Google 검색 그라운딩."""
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"gemini-2.5-flash:generateContent?key={GEMINI_KEY}")
+    r = requests.post(url, json={
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+    }, timeout=180)
+    data = r.json()
+    parts = data["candidates"][0]["content"]["parts"]
+    return "\n".join(p.get("text", "") for p in parts if "text" in p)
+
+
+def _ai_query_claude(prompt):
+    """Claude API + 웹서치 (ANTHROPIC_API_KEY 보유 시 폴백)."""
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": ANTHROPIC_KEY,
+                 "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+        json={"model": "claude-sonnet-4-6",
+              "max_tokens": 2000,
+              "messages": [{"role": "user", "content": prompt}],
+              "tools": [{"type": "web_search_20250305", "name": "web_search",
+                         "max_uses": 8}]},
+        timeout=180,
+    )
+    data = r.json()
+    return "\n".join(b.get("text", "") for b in data.get("content", [])
+                     if b.get("type") == "text")
+
+
 def collect_ai():
-    """4개 체감 항목을 Claude가 웹서치로 조사·채점. 실패 시 None → 사용자 질문으로 전환."""
-    if not ANTHROPIC_KEY:
+    """5개 체감 항목을 AI가 웹검색으로 조사·채점 (Gemini 무료 우선, Claude 폴백).
+    실패 시 None → 해당 항목이 사용자 질문으로 전환."""
+    if not (GEMINI_KEY or ANTHROPIC_KEY):
         return None
     guides = "\n".join(f'- "{q["name"]}": {q["guide"]}' for q in AI_QUESTIONS)
     prompt = (
-        "당신은 한국 주식시장 심리 분석가다. 오늘 기준으로 아래 4개 항목을 웹 검색으로 조사하고 "
+        "당신은 한국 주식시장 심리 분석가다. 오늘 기준으로 아래 5개 항목을 웹 검색으로 조사하고 "
         "각각 1~5점(1=극단적 공포, 5=극단적 탐욕)으로 채점하라.\n\n"
         f"{guides}\n\n"
         "규칙: 반드시 최근 1~2주 내 한국 뉴스·데이터를 근거로 하라. 각 항목 근거는 한 문장.\n"
@@ -321,21 +357,7 @@ def collect_ai():
         '[{"name": "항목명", "score": 3, "rationale": "근거 한 줄"}]'
     )
     try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_KEY,
-                     "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-6",
-                  "max_tokens": 2000,
-                  "messages": [{"role": "user", "content": prompt}],
-                  "tools": [{"type": "web_search_20250305", "name": "web_search",
-                             "max_uses": 8}]},
-            timeout=180,
-        )
-        data = r.json()
-        text = "\n".join(b.get("text", "") for b in data.get("content", [])
-                         if b.get("type") == "text")
+        text = _ai_query_gemini(prompt) if GEMINI_KEY else _ai_query_claude(prompt)
         m = re.search(r"\[.*\]", text.replace("```json", "").replace("```", ""), re.S)
         parsed = json.loads(m.group(0))
         by_name = {p["name"]: p for p in parsed}
