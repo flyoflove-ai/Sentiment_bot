@@ -571,9 +571,17 @@ def build_final(auto, ai, answers):
 # 텔레그램 I/O
 # ======================================================================
 def send(chat_id, text):
-    requests.post(f"{API}/sendMessage",
-                  json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-                  timeout=15)
+    try:
+        r = requests.post(f"{API}/sendMessage",
+                          json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                          timeout=15)
+        ok = bool(r.json().get("ok"))
+        if not ok:
+            print(f"[send 실패] {r.text[:200]}")
+        return ok
+    except Exception as e:
+        print(f"[send 예외] {e}")
+        return False
 
 
 def save_state(auto, ai):
@@ -652,7 +660,9 @@ def run_diagnosis(chat_id, header=None):
     """전체 진단 1회: 정량 + AI조사 발송 → 설문 전송 → 잠정 진단 → 답장 대기."""
     if header:
         send(chat_id, header)
-    send(chat_id, "⏳ 정량 지표 수집 + AI 웹조사 중... (최대 2~3분)")
+    if not send(chat_id, "⏳ 정량 지표 수집 + AI 웹조사 중... (최대 2~3분)"):
+        raise RuntimeError("텔레그램 발송 실패 — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 확인 "
+                           "(봇에게 /start를 먼저 보냈는지도 확인). 헛대기 방지를 위해 즉시 중단")
     drain_updates()
     auto = collect_auto()
     ai = collect_ai()
