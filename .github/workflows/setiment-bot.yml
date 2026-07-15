@@ -34,7 +34,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25    # 진단(~3분) + 답장 대기(15분) + 여유
+    timeout-minutes: 12    # 진단(~3분) + 답장 대기(5분) + 여유
     steps:
       - uses: actions/checkout@v4
 
@@ -65,7 +65,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          ANSWER_WAIT_MIN: '15'   # 답장 대기 시간(분). 0이면 대기 없이 잠정 진단만
+          ANSWER_WAIT_MIN: '5'    # 답장 대기 시간(분). 0이면 대기 없음 (답장은 15:40 일일 실행이 수거)
         run: python sentiment_bot.py --${{ steps.mode.outputs.mode }}
 
       - name: Persist state
