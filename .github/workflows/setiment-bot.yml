@@ -44,7 +44,7 @@ jobs:
           cache: 'pip'
 
       - name: Install deps
-        run: pip install -q yfinance requests
+        run: pip install -q -r requirements.txt
 
       - name: Determine mode
         id: mode
