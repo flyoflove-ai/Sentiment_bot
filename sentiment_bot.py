@@ -330,10 +330,41 @@ def collect_auto():
 # ======================================================================
 # AI 웹조사 채점 (Claude API + web search)
 # ======================================================================
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")  # 수동 지정 시 최우선
+_GEMINI_CACHE = {"model": None}
+
+
+def _gemini_pick_model():
+    """사용 가능한 Gemini 모델 자동 선택 (v13.2).
+    모델 지원 종료('no longer available to new users')에 대비해 하드코딩 대신
+    ListModels API로 실시간 조회 → flash 계열 최신 선택. GEMINI_MODEL env로 수동 지정 가능."""
+    if _GEMINI_CACHE["model"]:
+        return _GEMINI_CACHE["model"]
+    if GEMINI_MODEL:
+        _GEMINI_CACHE["model"] = GEMINI_MODEL
+        return GEMINI_MODEL
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models"
+                         f"?key={GEMINI_KEY}&pageSize=200", timeout=30).json()
+        avail = [m["name"].split("/")[-1] for m in r.get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        # flash 계열 (특수 모델 제외) 중 최신 버전 우선
+        flash = [n for n in avail if "flash" in n
+                 and all(x not in n for x in ("lite", "image", "tts", "audio", "live", "exp"))]
+        pick = sorted(flash, reverse=True)[0] if flash else (avail[0] if avail else None)
+        if pick:
+            print(f"[Gemini 모델 자동 선택] {pick}")
+            _GEMINI_CACHE["model"] = pick
+            return pick
+    except Exception as e:
+        print(f"[Gemini 모델 조회 실패] {e}")
+    return "gemini-flash-latest"  # 최후 폴백 (별칭)
+
+
 def _ai_query_gemini(prompt):
     """Gemini API (무료 티어) + Google 검색 그라운딩."""
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-2.5-flash:generateContent?key={GEMINI_KEY}")
+           f"{_gemini_pick_model()}:generateContent?key={GEMINI_KEY}")
     r = requests.post(url, json={
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
@@ -418,40 +449,58 @@ DIGEST_DAYS = 10
 DIGEST_WEIGHT = 6
 
 
+def _extract_date(name):
+    """파일명에서 날짜 추출: YYYY-MM-DD 또는 YYYYMMDD 모두 지원 (v13.1)."""
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", name) or re.search(r"(\d{4})(\d{2})(\d{2})", name)
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+
+
 def read_digests(days=DIGEST_DAYS):
-    """최근 N일치 다이제스트 텍스트 수집. 같은 repo(DIGEST_DIR) 우선,
-    없으면 GitHub API로 타 repo(DIGEST_REPO) 조회. 파일명에 YYYY-MM-DD 포함 가정."""
+    """최근 N일치 다이제스트 텍스트 수집 (v13.1: 하위 폴더 포함, YYYYMMDD 파일명 지원).
+    같은 repo(DIGEST_DIR) 우선, 없으면 GitHub API로 타 repo(DIGEST_REPO) 조회."""
     import datetime
     cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     chunks = []
     # (a) 로컬 디렉토리 (심리봇과 같은 repo에 다이제스트가 커밋되는 경우)
     if os.path.isdir(DIGEST_DIR):
-        for fn in sorted(os.listdir(DIGEST_DIR)):
-            m = re.search(r"(\d{4}-\d{2}-\d{2})", fn)
-            if m and m.group(1) >= cutoff and fn.endswith((".md", ".txt")):
-                try:
-                    with open(os.path.join(DIGEST_DIR, fn), encoding="utf-8") as f:
-                        chunks.append((m.group(1), f.read()))
-                except Exception:
-                    pass
+        for root, _dirs, files in os.walk(DIGEST_DIR):
+            for fn in files:
+                d = _extract_date(fn)
+                if d and d >= cutoff and fn.endswith((".md", ".txt")):
+                    try:
+                        with open(os.path.join(root, fn), encoding="utf-8") as f:
+                            chunks.append((d, f.read()))
+                    except Exception:
+                        pass
+        if not chunks:
+            print(f"[다이제스트 없음] '{DIGEST_DIR}/'는 존재하나 최근 {days}일 내 "
+                  f"날짜(YYYY-MM-DD 또는 YYYYMMDD)가 포함된 .md/.txt 파일이 없음")
     # (b) 타 repo (리서치 에이전트 repo가 별도인 경우, GH_PAT 필요)
     elif DIGEST_REPO:
         try:
             headers = {"Authorization": f"Bearer {GH_PAT}"} if GH_PAT else {}
             r = requests.get(f"https://api.github.com/repos/{DIGEST_REPO}/contents/{DIGEST_PATH}",
                              headers=headers, timeout=30).json()
+            if isinstance(r, dict) and r.get("message"):
+                raise RuntimeError(f"GitHub API: {r['message']} "
+                                   f"(repo={DIGEST_REPO}, path={DIGEST_PATH} — GH_PAT 권한/경로 확인)")
             import base64
             for item in (r if isinstance(r, list) else []):
-                m = re.search(r"(\d{4}-\d{2}-\d{2})", item.get("name", ""))
-                if not (m and m.group(1) >= cutoff and item["name"].endswith((".md", ".txt"))):
+                d = _extract_date(item.get("name", ""))
+                if not (d and d >= cutoff and item["name"].endswith((".md", ".txt"))):
                     continue
                 fr = requests.get(item["url"], headers=headers, timeout=30).json()
                 text = base64.b64decode(fr.get("content", "")).decode("utf-8", "ignore")
-                chunks.append((m.group(1), text))
+                chunks.append((d, text))
+            if not chunks:
+                print(f"[다이제스트 없음] {DIGEST_REPO}/{DIGEST_PATH} 에 최근 {days}일 파일 없음")
         except Exception as e:
             print(f"[다이제스트 원격 조회 실패] {e}")
+    else:
+        print(f"[다이제스트 미구성] 로컬 '{DIGEST_DIR}/' 없음 + DIGEST_REPO 미설정 — 지표 제외")
     if not chunks:
         return None
+    print(f"[다이제스트 수집] {len(chunks)}일치 확보")
     # 일자별 최대 2,500자로 절단해 프롬프트 크기 관리
     return "\n\n".join(f"### {d}\n{t[:2500]}" for d, t in sorted(chunks)[-days:])
 
@@ -459,6 +508,7 @@ def read_digests(days=DIGEST_DAYS):
 def collect_digest_item():
     """다이제스트 10일치 → 애널리스트 톤 1~5점 채점. 실패 시 None (지표 제외)."""
     if not (GEMINI_KEY or ANTHROPIC_KEY):
+        print("[다이제스트 채점 불가] GEMINI_API_KEY 미설정 — Secret 등록 필요")
         return None
     text = read_digests()
     if not text:
