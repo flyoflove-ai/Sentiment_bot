@@ -481,20 +481,15 @@ def build_interim(auto, ai):
     return "\n".join(lines)
 
 
-def build_questions(include_ai_fallback):
-    qs = list(USER_QUESTIONS) + ([{"name": q["name"], "weight": q["weight"],
-                                   "anchors": None, "guide": q["guide"]}
-                                  for q in AI_QUESTIONS] if include_ai_fallback else [])
-    n = len(qs)
-    lines = [f"📝 *체감 설문 {n}문항* — 각 1~5점. 애매하면 `1or2` 처럼 범위 허용",
-             "예: `2 1or2 1or2 3`" if n == 4 else "예: `2 1or2 2 3 1 1 1 4 4`"]
-    for idx, q in enumerate(qs, 1):
+def build_questions(include_ai_fallback=False):
+    """체감 설문 — 항상 사용자 4문항 고정 (v9). AI 조사 항목은 실패해도 묻지 않고
+    가중치에서 제외 후 재정규화."""
+    lines = ["📝 *체감 설문 4문항* — 각 1~5점. 애매하면 `1or2` 처럼 범위 허용",
+             "예: `2 1or2 1or2 3`"]
+    for idx, q in enumerate(USER_QUESTIONS, 1):
         lines.append(f"\n*{idx}. {q['name']}*")
-        if q.get("anchors"):
-            for s in range(1, 6):
-                lines.append(f"  {s}점: {q['anchors'][s]}")
-        else:
-            lines.append(f"  기준: {q['guide']}")
+        for s in range(1, 6):
+            lines.append(f"  {s}점: {q['anchors'][s]}")
     return "\n".join(lines)
 
 
@@ -526,15 +521,16 @@ def build_final(auto, ai, answers):
                      "참여 항목을 3점으로 캡해 온도 왜곡 제거 (2020.3 백테스트: 미보정 시 "
                      "10년 최고 매수 기회를 '공포 22'로 오판). 군중 유입 자체는 바닥도 상투도 "
                      "아님 — 아래 유형 분류가 판단 기준")
-    # 사용자 소계
+    # 사용자 소계 (v9: AI 조사 실패 시 해당 가중 20 제외 후 재정규화)
+    user_avg = sum(a * q["weight"] for a, q in zip(answers, USER_QUESTIONS)) / USER_W
     if ai:
-        user_avg = sum(a * q["weight"] for a, q in zip(answers, USER_QUESTIONS)) / USER_W
         sub_avg = (ai["avg"] * AI_W + user_avg * USER_W) / (AI_W + USER_W)
+        sub_w = AI_W + USER_W
     else:
-        all_q = USER_QUESTIONS + AI_QUESTIONS
-        total_w = sum(q["weight"] for q in all_q)
-        sub_avg = sum(a * q["weight"] for a, q in zip(answers, all_q)) / total_w
-    total_avg = (auto["avg"] * AUTO_WEIGHT_TOTAL + sub_avg * (AI_W + USER_W)) / 100
+        sub_avg = user_avg
+        sub_w = USER_W
+    denom = AUTO_WEIGHT_TOTAL + sub_w
+    total_avg = (auto["avg"] * AUTO_WEIGHT_TOTAL + sub_avg * sub_w) / denom
     temp = (total_avg - 1) / 4 * 100
     name, action = regime(temp)
     gap = sub_avg - auto["avg"]
@@ -547,19 +543,22 @@ def build_final(auto, ai, answers):
         gap_msg = "데이터 > 체감: 시장이 먼저 움직임. 대중 미참여 국면"
     else:
         gap_msg = "체감·데이터 정렬 — 국면 판정 신뢰도 높음"
+    ai_line = ""
+    if ai:
+        ai_line = "AI조사: " + " · ".join(f"{i['name']} {i['score']}" for i in ai["items"]) + "\n"
+    else:
+        ai_line = "_AI 조사 미가용 — 정량 60 : 개인 체감 20으로 재정규화 산출_\n"
     msg = (
         f"🌡 *시장 심리 온도: {temp:.0f} / 100*\n"
         f"판정: {name}\n\n"
-        f"정량(60): {auto['avg']:.2f}/5 · 체감(40): {sub_avg:.2f}/5\n"
+        f"정량({AUTO_WEIGHT_TOTAL}): {auto['avg']:.2f}/5 · 체감({sub_w}): {sub_avg:.2f}/5\n"
+        + ai_line
         + (f"국내 {auto['국내']:.2f} vs 글로벌 {auto['글로벌']:.2f} "
            f"(괴리 {auto['국내']-auto['글로벌']:+.2f})\n"
            if auto.get('국내') is not None and auto.get('글로벌') is not None else "")
         + f"체감-정량 괴리: {gap:+.2f} — {gap_msg}\n\n"
         f"📌 {action}"
     )
-    dt = classify_downturn(auto, ai)
-    if dt:
-        notes.append(dt)
     # 변동성 피크아웃 게이트 (v4, 2008 교훈): 극단 공포에서도 피크아웃 전엔 1차 분할만
     if temp < 20:
         m = auto.get("meta", {})
@@ -577,6 +576,14 @@ def build_final(auto, ai, answers):
     for n in notes:
         msg += f"\n\n{n}"
     msg += "\n\n_※ 심리 지표는 타이밍이 아닌 위험관리 도구. 극단 구간에서만 역발상 신호로 유효. 투자 자문 아님._"
+    # v9.1: 국면 유형 판정 — 항상 최하단 고정 (매 진단 동일 위치에서 비교)
+    dt = classify_downturn(auto, ai)
+    msg += "\n\n━━━━━━━━━━━━\n🏷 *국면 유형 판정*\n"
+    msg += dt if dt else ("해당 없음 — 뚜렷한 하락 국면 아님 "
+                          "(유형 분류는 고점比 -10% 이상 낙폭 진행 구간에서만 발동)")
+    msg += ("\n\n(비교 기준) ⚡이벤트형: 2020.3·2026.3 → V자 반등 / "
+            "⚠️혼합형: 2008 vs 2020 분기점 / 🪜청산형: 반대매매 소진까지 계단식 / "
+            "🐌침식형: 2000~02, 심리 역발상 무효")
     return msg
 
 
@@ -639,7 +646,7 @@ def drain_updates():
 def wait_for_answers(chat_id, auto, ai, minutes):
     """진단 발송 후 같은 실행 안에서 답장을 대기 (long-poll). 수신 시 최종 진단 발송.
     상시 리스너 없이 단일 Actions 실행으로 문답을 완결하는 v6 핵심 메커니즘."""
-    n = 4 if ai else len(USER_QUESTIONS) + len(AI_QUESTIONS)
+    n = len(USER_QUESTIONS)  # v9: 항상 4문항
     offset = _read_json(OFFSET_FILE, {}).get("offset", 0)
     deadline = time.time() + minutes * 60
     while time.time() < deadline:
@@ -670,7 +677,8 @@ def wait_for_answers(chat_id, auto, ai, minutes):
 
 
 def run_diagnosis(chat_id, header=None):
-    """전체 진단 1회: 정량 + AI조사 발송 → 설문 전송 → 잠정 진단 → 답장 대기."""
+    """전체 진단 1회 (v9): 정량(+AI) 발송 → 설문 4문항 → 답장 대기 →
+    답장 수신 시 종합 최종 리포트 1통 / 무응답 시 지난 응답 기반 잠정 진단으로 마감."""
     if header:
         send(chat_id, header)
     if not send(chat_id, "⏳ 정량 지표 수집 + AI 웹조사 중... (최대 2~3분)"):
@@ -681,25 +689,23 @@ def run_diagnosis(chat_id, header=None):
     ai = collect_ai()
     save_state(auto, ai)
     send(chat_id, build_interim(auto, ai))
-    send(chat_id, build_questions(include_ai_fallback=(ai is None)))
-    prev = _read_json(ANSWERS_FILE, None)
-    n_needed = 4 if ai else len(USER_QUESTIONS) + len(AI_QUESTIONS)
-    if prev and len(prev.get("answers", [])) == n_needed:
-        send(chat_id,
-             f"📎 *잠정 전체 진단* — 지난 응답({prev.get('date', '?')}) 재사용\n\n"
-             + build_final(auto, ai, prev["answers"]))
-    wait_min = int(os.environ.get("ANSWER_WAIT_MIN", "15"))
+    send(chat_id, build_questions())
+    wait_min = int(os.environ.get("ANSWER_WAIT_MIN", "5"))
+    got = False
     if wait_min > 0:
         send(chat_id, f"⌛ 지금부터 *{wait_min}분간* 답장을 대기합니다. "
-                      f"숫자 {n_needed}개 회신 시 즉시 최종 진단 발송 "
-                      "(놓치면 다음 실행 때 갱신)")
+                      "숫자 4개 회신 시 종합 최종 진단을 한 번에 발송합니다")
         got = wait_for_answers(chat_id, auto, ai, wait_min)
-        if not got:
-            send(chat_id, "⌛ 대기 종료 — 잠정 진단으로 마감합니다. "
-                          "체감 갱신은 다음 정기/긴급 실행 때 답장해 주세요")
-
-
-CRASH_THRESHOLD = -0.10  # v7: 급락 판정 임계 (전일 종가 대비 -10%, 서킷브레이커급)
+    if not got:
+        prev = _read_json(ANSWERS_FILE, None)
+        if prev and len(prev.get("answers", [])) == len(USER_QUESTIONS):
+            send(chat_id,
+                 f"⌛ 대기 종료 — 지난 응답({prev.get('date', '?')}) 재사용 잠정 진단으로 마감. "
+                 "체감이 변했다면 숫자 4개를 답장해 두세요 (15:40 일일 실행이 수거)\n\n"
+                 + build_final(auto, ai, prev["answers"]))
+        else:
+            send(chat_id, "⌛ 대기 종료 — 저장된 응답이 없어 잠정 진단 생략. "
+                          "숫자 4개를 답장해 두면 15:40 실행에서 최종 진단을 발송합니다")
 
 
 def crash_check(chat_id):
@@ -731,7 +737,7 @@ def handle_message(chat_id, text):
         return
     state = load_state()
     if state:
-        n = 4 if state["ai"] else len(USER_QUESTIONS) + len(AI_QUESTIONS)
+        n = len(USER_QUESTIONS)  # v9: 항상 4문항
         answers = parse_answers(text, n)
         if answers:
             import datetime
@@ -794,9 +800,7 @@ def process_pending(chat_id):
         if text in ("심리", "/sentiment", "/심리", "시장심리", "긴급", "진단"):
             want_diag = True
             continue
-        state = load_state()
-        n = 4 if (not state or state.get("ai")) else len(USER_QUESTIONS) + len(AI_QUESTIONS)
-        ans = parse_answers(text, n)
+        ans = parse_answers(text, len(USER_QUESTIONS))  # v9: 항상 4문항
         if ans:
             pending_answers = ans  # 여러 개면 마지막 것 사용
     _write_json(OFFSET_FILE, {"offset": offset})
