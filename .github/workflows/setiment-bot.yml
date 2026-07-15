@@ -4,7 +4,7 @@
 # Actions 사용량: 주간 진단 4~5회 × 최대 20분 + 급락체크 22회 × 1분 ≈ 월 120~150분
 #                → private repo 무료 한도(2,000분/월) 내 여유. 완전 무료 운영 가능
 #
-# Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY, FRED_API_KEY(선택)
+# Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY(무료), FRED_API_KEY(선택)
 #
 # 사용법:
 #   · 매주 화요일 08:30 KST 자동 전체 진단 → 발송 후 15분간 답장 대기
@@ -63,7 +63,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           ANSWER_WAIT_MIN: '15'   # 답장 대기 시간(분). 0이면 대기 없이 잠정 진단만
         run: python sentiment_bot.py --${{ steps.mode.outputs.mode }}
