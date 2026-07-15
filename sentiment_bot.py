@@ -319,6 +319,8 @@ def _ai_query_gemini(prompt):
         "tools": [{"google_search": {}}],
     }, timeout=180)
     data = r.json()
+    if "error" in data:  # 키 오류·쿼터 초과 등을 명시적으로 노출
+        raise RuntimeError(f"Gemini API 오류: {data['error'].get('message', data['error'])}")
     parts = data["candidates"][0]["content"]["parts"]
     return "\n".join(p.get("text", "") for p in parts if "text" in p)
 
@@ -356,22 +358,33 @@ def collect_ai():
         '응답은 JSON 배열만 출력하라. 마크다운 백틱·서문 금지. 형식: '
         '[{"name": "항목명", "score": 3, "rationale": "근거 한 줄"}]'
     )
+    provider = "Gemini" if GEMINI_KEY else "Claude"
     try:
         text = _ai_query_gemini(prompt) if GEMINI_KEY else _ai_query_claude(prompt)
         m = re.search(r"\[.*\]", text.replace("```json", "").replace("```", ""), re.S)
+        if not m:
+            raise ValueError(f"응답에서 JSON 배열 미발견: {text[:200]!r}")
         parsed = json.loads(m.group(0))
-        by_name = {p["name"]: p for p in parsed}
         items = []
-        for q in AI_QUESTIONS:
-            p = by_name.get(q["name"])
-            if not p or not (1 <= int(p["score"]) <= 5):
-                return None  # 하나라도 누락되면 전체 폴백
-            items.append({"name": q["name"], "score": int(p["score"]),
+        for idx, q in enumerate(AI_QUESTIONS):
+            # 이름 정확 일치 → 부분 일치 → 순서 기반 순으로 매칭 (모델별 표기 편차 흡수)
+            p = next((x for x in parsed if x.get("name") == q["name"]), None)
+            if p is None:
+                key = q["name"][:4]
+                p = next((x for x in parsed if key in str(x.get("name", ""))), None)
+            if p is None and idx < len(parsed):
+                p = parsed[idx]
+            score = int(p["score"]) if p and "score" in p else None
+            if score is None or not (1 <= score <= 5):
+                raise ValueError(f"항목 채점 누락: {q['name']} / 응답: {p}")
+            items.append({"name": q["name"], "score": score,
                           "weight": q["weight"], "lagging": q["lagging"],
                           "rationale": str(p.get("rationale", ""))[:120]})
         avg = sum(i["score"] * i["weight"] for i in items) / AI_W
+        print(f"[AI 조사 성공] {provider}, 소계 {avg:.2f}/5")
         return {"items": items, "avg": avg, "weight": AI_W}
-    except Exception:
+    except Exception as e:
+        print(f"[AI 조사 실패 → 9문항 폴백] {provider}: {type(e).__name__}: {e}")
         return None
 
 
