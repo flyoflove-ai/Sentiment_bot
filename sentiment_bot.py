@@ -331,49 +331,99 @@ def collect_auto():
 # AI 웹조사 채점 (Claude API + web search)
 # ======================================================================
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")  # 수동 지정 시 최우선
-_GEMINI_CACHE = {"model": None}
+_GEMINI_CACHE = {"cands": None, "model": None}
 
 
-def _gemini_pick_model():
-    """사용 가능한 Gemini 모델 자동 선택 (v13.2).
-    모델 지원 종료('no longer available to new users')에 대비해 하드코딩 대신
-    ListModels API로 실시간 조회 → flash 계열 최신 선택. GEMINI_MODEL env로 수동 지정 가능."""
-    if _GEMINI_CACHE["model"]:
-        return _GEMINI_CACHE["model"]
-    if GEMINI_MODEL:
-        _GEMINI_CACHE["model"] = GEMINI_MODEL
-        return GEMINI_MODEL
+def _gemini_model_candidates():
+    """사용 가능한 Gemini 모델 후보 (v13.4): 안정판 flash → 안정판 pro → 기타 순.
+    'preview'/'omni' 등 무료 한도 0인 계열 배제, 버전 숫자 내림차순."""
+    if _GEMINI_CACHE["cands"]:
+        return _GEMINI_CACHE["cands"]
+    cands = [GEMINI_MODEL] if GEMINI_MODEL else []
     try:
         r = requests.get("https://generativelanguage.googleapis.com/v1beta/models"
                          f"?key={GEMINI_KEY}&pageSize=200", timeout=30).json()
         avail = [m["name"].split("/")[-1] for m in r.get("models", [])
                  if "generateContent" in m.get("supportedGenerationMethods", [])]
-        # flash 계열 (특수 모델 제외) 중 최신 버전 우선
-        flash = [n for n in avail if "flash" in n
-                 and all(x not in n for x in ("lite", "image", "tts", "audio", "live", "exp"))]
-        pick = sorted(flash, reverse=True)[0] if flash else (avail[0] if avail else None)
-        if pick:
-            print(f"[Gemini 모델 자동 선택] {pick}")
-            _GEMINI_CACHE["model"] = pick
-            return pick
+        bad = ("lite", "image", "tts", "audio", "live", "exp", "preview", "omni",
+               "embedding", "thinking")
+
+        def ver(n, fam):
+            m = re.search(rf"gemini-(\d+(?:\.\d+)?)-{fam}", n)
+            return float(m.group(1)) if m else -1.0
+
+        clean = [n for n in avail if all(x not in n for x in bad)]
+        flash = sorted([n for n in clean if ver(n, "flash") > 0],
+                       key=lambda n: ver(n, "flash"), reverse=True)
+        pro = sorted([n for n in clean if ver(n, "pro") > 0],
+                     key=lambda n: ver(n, "pro"), reverse=True)
+        cands += flash[:3]
+        if "gemini-flash-latest" in avail:
+            cands.append("gemini-flash-latest")
+        cands += pro[:2]
+        if len(cands) <= (1 if GEMINI_MODEL else 0):
+            cands += clean[:3] or avail[:3]  # 최후: 아무 모델이라도
     except Exception as e:
         print(f"[Gemini 모델 조회 실패] {e}")
-    return "gemini-flash-latest"  # 최후 폴백 (별칭)
+    if not cands:
+        cands = ["gemini-flash-latest", "gemini-2.5-flash"]
+    seen, dedup = set(), []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c); dedup.append(c)
+    _GEMINI_CACHE["cands"] = dedup
+    print(f"[Gemini 후보 모델] {dedup}")
+    return dedup
 
 
 def _ai_query_gemini(prompt):
-    """Gemini API (무료 티어) + Google 검색 그라운딩."""
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{_gemini_pick_model()}:generateContent?key={GEMINI_KEY}")
-    r = requests.post(url, json={
-        "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-    }, timeout=180)
-    data = r.json()
-    if "error" in data:  # 키 오류·쿼터 초과 등을 명시적으로 노출
-        raise RuntimeError(f"Gemini API 오류: {data['error'].get('message', data['error'])}")
-    parts = data["candidates"][0]["content"]["parts"]
-    return "\n".join(p.get("text", "") for p in parts if "text" in p)
+    """Gemini API + 검색 그라운딩 (v13.4).
+    - 후보 체인: 무료 한도 0(limit: 0)·미존재·권한 오류 → 즉시 다음 후보
+    - 일시 분당 한도('retry in Ns') → 자동 대기 후 같은 모델 1회 재시도
+    - 전 후보가 limit:0 → 키 프로젝트 자체에 무료 티어 없음으로 확정 진단"""
+    last_err = None
+    all_zero_quota = True
+    models = ([_GEMINI_CACHE["model"]] if _GEMINI_CACHE["model"] else []) + \
+             [m for m in _gemini_model_candidates() if m != _GEMINI_CACHE["model"]]
+    for model in models:
+        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent?key={GEMINI_KEY}")
+        for attempt in (1, 2):
+            data = requests.post(url, json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "tools": [{"google_search": {}}],
+            }, timeout=180).json()
+            if "error" not in data:
+                parts = data["candidates"][0]["content"]["parts"]
+                _GEMINI_CACHE["model"] = model
+                print(f"[Gemini 사용 모델] {model}")
+                return "\n".join(p.get("text", "") for p in parts if "text" in p)
+            msg = str(data["error"].get("message", data["error"]))
+            low = msg.lower()
+            last_err = RuntimeError(f"Gemini API 오류: {msg}")
+            if "limit: 0" in msg:
+                print(f"[Gemini {model} 무료 한도 0 → 다음 후보]")
+                break  # 이 모델은 무료 미지원 — 재시도 무의미
+            all_zero_quota = False
+            if "retry in" in low and attempt == 1:
+                m = re.search(r"retry in (\d+)", low)
+                wait = min(int(m.group(1)) + 2, 70) if m else 35
+                print(f"[Gemini {model} 일시 한도 → {wait}초 대기 후 재시도]")
+                time.sleep(wait)
+                continue
+            if any(k in low for k in ("quota", "rate", "no longer available",
+                                      "not found", "permission", "not supported")):
+                print(f"[Gemini {model} 실패 → 다음 후보] {msg[:100]}")
+                break
+            raise last_err  # 그 외 오류는 즉시 표면화
+    if all_zero_quota and last_err:
+        raise RuntimeError(
+            "진단: 모든 후보 모델이 '무료 한도 0(limit: 0)' — 쿼터 소진이 아니라 "
+            "이 GEMINI_API_KEY의 프로젝트에 무료 티어가 배정되지 않은 상태입니다. "
+            "조치: aistudio.google.com/apikey → Create API key → 'Create API key in "
+            "new project' 선택으로 새 키 발급 → Secret GEMINI_API_KEY 교체. "
+            f"(마지막 오류: {last_err})")
+    raise last_err or RuntimeError("Gemini 후보 모델 전부 실패")
 
 
 def _ai_query_claude(prompt):
