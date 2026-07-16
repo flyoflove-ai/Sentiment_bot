@@ -871,14 +871,27 @@ def build_portfolio_guide(temp, auto, ai):
              f"목표 현금 밴드: *{lo}~{hi}%* (온도 {temp:.0f})"]
     for n in notes:
         lines.append(f"· {n}")
+    band_ref = ("(비교 기준) 온도별 목표 현금: 0~20 극단공포 → 10~25% / "
+                "20~40 공포 → 20~35% / 40~60 중립 → 30~40% / "
+                "60~80 탐욕 → 40~55% / 80~100 극단탐욕 → 55~70% "
+                "(+유형 수정자: 침식형=현금 45%↑ 강제, 청산미완=상단 운용, "
+                "이벤트형+피크아웃=하단 운용)")
     p = _read_json(PORTFOLIO_FILE, None)
     if not p:
         lines.append("포트 미등록 — 텔레그램에 `포트 삼성전자 40, SK하이닉스 20, "
                      "삼성전기 20, 현금 20` 형식으로 보내면 맞춤 리밸런싱 계산")
+        lines.append("\n" + band_ref)
         return "\n".join(lines)
     alloc = p["alloc"]
     cash = sum(v for k, v in alloc.items() if k.lower() in CASH_KEYS)
-    lines.append(f"\n등록 포트({p['date']}): "
+    import datetime
+    try:
+        age = (datetime.date.today()
+               - datetime.date.fromisoformat(p["date"])).days
+    except Exception:
+        age = 0
+    stale = f" ⚠️{age}일 경과 — 변동 있으면 `포트 ...`로 갱신" if age >= 7 else ""
+    lines.append(f"\n등록 포트({p['date']}{stale}): "
                  + " · ".join(f"{k} {v:.0f}%" for k, v in alloc.items()))
     if cash < lo:
         lines.append(f"→ 현금 {cash:.0f}% < 하단 {lo}%: 주식 비중 "
@@ -896,6 +909,7 @@ def build_portfolio_guide(temp, auto, ai):
     elif len(eq) >= 2 and eq[0][1] + eq[1][1] >= 60:
         lines.append(f"⚠️ 집중도: 상위 2종목 {eq[0][1] + eq[1][1]:.0f}% — 동일방향 클러스터면 "
                      "실질 분산 아님 (독립 수요 드라이버 여부 점검)")
+    lines.append("\n" + band_ref)
     return "\n".join(lines)
 
 
@@ -962,7 +976,10 @@ def drain_updates():
             msg = upd.get("message") or {}
             if CHAT_ID and str(msg.get("chat", {}).get("id", "")) != str(CHAT_ID):
                 continue
-            ans = parse_answers((msg.get("text") or "").strip(), len(USER_QUESTIONS))
+            _t = (msg.get("text") or "").strip()
+            if _handle_portfolio_cmd(str(msg.get("chat", {}).get("id", "")), _t):
+                continue  # v14.1: 밤사이 보낸 포트 갱신도 진단 전에 반영
+            ans = parse_answers(_t, len(USER_QUESTIONS))
             if ans:
                 salvaged = ans  # 여러 개면 마지막 것
     except Exception:
