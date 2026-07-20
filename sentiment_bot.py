@@ -885,6 +885,30 @@ def cash_target_band(temp, auto, ai):
     return lo, hi, notes
 
 
+def rebalance_plan(alloc, cash_now, target_cash):
+    """현금 목표치 도달을 위한 종목별 비례 배분 조정 플랜 (v15.2).
+    주식 축소/확대분을 각 종목의 현재 비중에 비례해 배분 — 포트 구조(상대 비중)를
+    유지한 채 노출만 조절. 반환: 표시용 라인 리스트."""
+    eq = {k: v for k, v in alloc.items() if k.lower() not in CASH_KEYS}
+    eq_total = sum(eq.values())
+    if eq_total <= 0.5:
+        return ["   (보유 종목 없음 — 신규 편입은 종목 선택이 선행되어야 함)"]
+    # 주식 총량을 (100-현재현금) → (100-목표현금)으로 스케일 = 종목별 동일 배율
+    factor = (100.0 - target_cash) / (100.0 - cash_now)
+    out = []
+    for k, v in sorted(eq.items(), key=lambda x: -x[1]):
+        nv = v * factor
+        d = nv - v
+        if abs(d) < 0.05:
+            continue
+        arrow = "▲" if d > 0 else "▼"
+        out.append(f"   · {k}: {v:.1f}% → {nv:.1f}% ({arrow}{abs(d):.1f}%p)")
+    d_cash = target_cash - cash_now
+    arrow = "▲" if d_cash > 0 else "▼"
+    out.append(f"   · 현금: {cash_now:.1f}% → {target_cash:.1f}% ({arrow}{abs(d_cash):.1f}%p)")
+    return out
+
+
 def build_portfolio_guide(temp, auto, ai):
     """💼 포트폴리오·현금 가이드 (v14). 규칙 기반 참고용."""
     lo, hi, notes = cash_target_band(temp, auto, ai)
@@ -915,11 +939,21 @@ def build_portfolio_guide(temp, auto, ai):
     lines.append(f"\n등록 포트({p['date']}{stale}): "
                  + " · ".join(f"{k} {v:.0f}%" for k, v in alloc.items()))
     if cash < lo:
+        mid = (lo + hi) / 2
         lines.append(f"→ 현금 {cash:.0f}% < 하단 {lo}%: 주식 비중 "
                      f"*{lo - cash:.0f}~{hi - cash:.0f}%p 축소* 검토")
+        lines.append(f"▶ *비례 배분 축소 플랜* (목표 현금 {mid:.1f}%·밴드 중앙, "
+                     f"최소 조정은 하단 {lo}%까지 {lo - cash:.0f}%p)")
+        lines += rebalance_plan(alloc, cash, mid)
+        lines.append("   (각 종목을 현재 비중 비례로 축소 — 상대 구조 유지. 분할 실행 권장)")
     elif cash > hi:
+        mid = (lo + hi) / 2
         lines.append(f"→ 현금 {cash:.0f}% > 상단 {hi}%: *{cash - hi:.0f}~{cash - lo:.0f}%p "
                      f"투입 여력* (분할·트리거 확인 후)")
+        lines.append(f"▶ *비례 배분 투입 플랜* (목표 현금 {mid:.1f}%·밴드 중앙, "
+                     f"최소 투입은 상단 {hi}%까지 {cash - hi:.0f}%p)")
+        lines += rebalance_plan(alloc, cash, mid)
+        lines.append("   (각 종목을 현재 비중 비례로 확대 — 상대 구조 유지. 분할·트리거 확인 후 실행)")
     else:
         lines.append(f"→ 현금 {cash:.0f}% 밴드 내: 비중 유지, 리밸런싱 불요")
     # 집중도 점검
