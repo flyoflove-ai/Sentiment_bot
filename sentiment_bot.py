@@ -816,18 +816,39 @@ CASH_KEYS = ("현금", "예수금", "cash", "mmf", "cma", "달러", "usd")
 
 
 def parse_portfolio(text):
-    """'포트 삼성전자 40, SK하이닉스 20, 삼성전기 20, 현금 20' 파싱 (v14).
-    반환: dict(정규화 배분) / 'SUM_ERR'(합계 이상) / None(포트 명령 아님)."""
-    if not re.match(r"^(포트폴리오|포트)\b", text.strip()):
-        return None
-    body = re.sub(r"^(포트폴리오|포트)\s*", "", text.strip())
-    pairs = re.findall(r"([가-힣A-Za-z0-9&.\-]+)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?", body)
+    """포트폴리오 등록 파싱 (v15.1 유연화).
+    지원 형식 (모두 동일 동작):
+      · 포트 삼성전자 40, SK하이닉스 20, 삼성전기 20, 현금 20   (기존)
+      · 삼성전자 35% SK하이닉스 40% LS Electric 2% 현금 12%    (접두어·쉼표 없이, % 표기)
+      · 공백 포함 종목명(LS Electric, Posco홀딩스 등) 지원
+    반환: dict(정규화 배분) / 'SUM_ERR' / 'FMT_ERR'(포트 접두어인데 파싱 불가) / None(포트 아님)
+    접두어 없는 경우엔 오인 방지를 위해 ①쌍 2개 이상 ②합계 80~120
+    ③'%' 또는 '현금' 포함 — 세 조건을 모두 만족할 때만 포트로 인정."""
+    t = text.strip()
+    has_prefix = bool(re.match(r"^(포트폴리오|포트)\b", t))
+    body = re.sub(r"^(포트폴리오|포트)\s*", "", t) if has_prefix else t
+
+    # 종목명: 문자로 시작, 공백 포함 가능(비탐욕) / 값: 숫자 + 선택적 %
+    pairs = re.findall(
+        r"([가-힣A-Za-z][가-힣A-Za-z0-9&.\- ]*?)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%?(?=[,\s]|$)",
+        body)
+    pairs = [(n.strip(), float(v)) for n, v in pairs if n.strip()]
+
     if not pairs:
-        return None
+        return "FMT_ERR" if has_prefix else None
+
     alloc = {}
     for name, v in pairs:
-        alloc[name] = alloc.get(name, 0) + float(v)
+        alloc[name] = alloc.get(name, 0) + v
     total = sum(alloc.values())
+
+    if not has_prefix:
+        # 접두어 없는 자유 형식: 강한 시그니처일 때만 포트로 인정 (일반 대화 오인 방지)
+        if len(alloc) < 2 or not (80 <= total <= 120) \
+           or not ("%" in t or any(k.lower() in CASH_KEYS for k in alloc)):
+            return None
+        return {k: round(v / total * 100, 1) for k, v in alloc.items()}
+
     if not (80 <= total <= 120):
         return "SUM_ERR"
     return {k: round(v / total * 100, 1) for k, v in alloc.items()}
@@ -1087,6 +1108,11 @@ def _handle_portfolio_cmd(chat_id, text):
     port = parse_portfolio(text)
     if port is None:
         return False
+    if port == "FMT_ERR":
+        send(chat_id, "⚠️ 포트 형식을 인식하지 못했습니다. 예:\n"
+                      "`포트 삼성전자 40, SK하이닉스 20, 현금 40` 또는\n"
+                      "`삼성전자 35% SK하이닉스 40% 현금 25%`")
+        return True
     if port == "SUM_ERR":
         send(chat_id, "⚠️ 비중 합계가 100%에서 크게 벗어납니다 (80~120% 허용). "
                       "예: `포트 삼성전자 40, SK하이닉스 20, 삼성전기 20, 현금 20`")
