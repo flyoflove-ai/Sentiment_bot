@@ -1123,6 +1123,91 @@ def handle_message(chat_id, text):
                  ("`2 1or2 1or2 3`" if n == 4 else "`2 1or2 2 3 1 1 1 4 4`"))
 
 
+SCHED_FILE = os.path.join(STATE_DIR, "sched_markers.json")  # 정기작업 중복 방지 (v15)
+
+
+def _now_kst():
+    import datetime
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+
+
+def _sched_due(key, hh, mm, markers):
+    """평일이고, 예정 시각이 지났고, 오늘 아직 안 했으면 True."""
+    now = _now_kst()
+    if now.weekday() >= 5:
+        return False
+    if markers.get(key) == now.date().isoformat():
+        return False
+    return (now.hour, now.minute) >= (hh, mm)
+
+
+def _sched_mark(key, markers):
+    markers[key] = _now_kst().date().isoformat()
+    _write_json(SCHED_FILE, markers)
+
+
+def resident_loop(minutes):
+    """--loop (v15): 상주 모드. 매시 Actions가 기동해 minutes분간 long polling.
+    · 메시지(포트 등록/진단 요청/설문 답장)에 수 초 내 응답
+    · 내부 시계로 정기작업 발동 — 크론 지연과 무관하게 정시 실행:
+        평일 11:00 KST  일일 정기 진단   (sched marker로 하루 1회 보장)
+        평일 15:40 KST  급락 체크(-10%)
+    · OFFSET_FILE을 매 건 동기화 → run_diagnosis 내부 drain_updates와 충돌 없음
+    · 마커는 state/에 즉시 기록, 실행 종료 시 workflow가 커밋 → 재기동 중복 방지"""
+    deadline = time.time() + minutes * 60
+    markers = _read_json(SCHED_FILE, {})
+    try:
+        requests.get(f"{API}/deleteWebhook", timeout=15)
+    except Exception:
+        pass
+    print(f"[상주 루프] {minutes}분간 대기 시작 (KST {_now_kst():%H:%M})")
+
+    while time.time() < deadline:
+        # ── 정기작업 체크 (지연 기동이어도 그날 안에는 반드시 실행) ──
+        try:
+            if _sched_due("weekly", 11, 0, markers):
+                _sched_mark("weekly", markers)
+                run_diagnosis(CHAT_ID, header="📅 *일일 심리 진단* (평일 11:00 KST)")
+            if _sched_due("crash", 15, 40, markers):
+                _sched_mark("crash", markers)
+                crash_check(CHAT_ID)
+        except Exception as e:
+            print("정기작업 오류:", e)
+
+        # ── 메시지 long polling ──
+        offset = _read_json(OFFSET_FILE, {}).get("offset", 0)
+        try:
+            remain = max(1, min(45, int(deadline - time.time())))
+            r = requests.get(f"{API}/getUpdates",
+                             params={"offset": offset, "timeout": remain},
+                             timeout=remain + 15).json()
+            if not r.get("ok"):
+                if "conflict" in r.get("description", "").lower():
+                    print("다른 인스턴스 폴링 중 → 20초 대기")
+                    time.sleep(20)
+                continue
+            for upd in r.get("result", []):
+                offset = upd["update_id"] + 1
+                _write_json(OFFSET_FILE, {"offset": offset})
+                msg = upd.get("message") or {}
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = (msg.get("text") or "").strip()
+                if not text:
+                    continue
+                if CHAT_ID and chat_id != str(CHAT_ID):
+                    continue
+                try:
+                    handle_message(chat_id, text)
+                except Exception as e:
+                    send(chat_id, f"⚠️ 오류: {type(e).__name__}: {e}")
+        except requests.exceptions.Timeout:
+            continue
+        except Exception as e:
+            print("루프 오류:", e)
+            time.sleep(10)
+    print("[상주 루프] 종료 — 다음 정각 기동이 이어받음")
+
+
 def poll_loop():
     offset = 0
     print("sentiment bot v3 polling...")
@@ -1243,7 +1328,9 @@ def auto_once():
 if __name__ == "__main__":
     if not BOT_TOKEN:
         sys.exit("TELEGRAM_BOT_TOKEN 환경변수를 설정하세요.")
-    if "--weekly" in sys.argv:
+    if "--loop" in sys.argv:
+        resident_loop(int(os.environ.get("LOOP_MINUTES", "55")))
+    elif "--weekly" in sys.argv:
         weekly()
     elif "--daily" in sys.argv:
         daily()                # 일일 장 마감: 메시지 수거 + 급락 체크 (조건 미충족 시 무발송 종료)
