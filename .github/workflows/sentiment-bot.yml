@@ -44,4 +44,50 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
       - name: Install deps
-        run: pip install -q -r
+        run: pip install -q -r requirements.txt
+      - name: Determine mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="weekly"     # 긴급 수동 = 즉시 전체 진단 후 종료
+          else
+            MODE="loop"       # 정각 크론 = 55분 상주
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "실행 모드: $MODE"
+      - name: Run sentiment bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DIGEST_REPO: ${{ secrets.DIGEST_REPO }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          ANSWER_WAIT_MIN: '5'    # 진단 발송 후 답장 대기(분) — 상주라 놓쳐도 즉시 회수됨
+          LOOP_MINUTES: '55'
+        # OS 레벨 3차 방어선: 3300초(55분) 후 SIGTERM, 30초 내 미종료 시 SIGKILL
+        # 타임아웃 종료(124/137)는 정상 처리 → 실패 알림 미발송, state 커밋 진행
+        run: |
+          timeout -k 30 3300 python sentiment_bot.py --${{ steps.mode.outputs.mode }} || code=$?
+          if [ "${code:-0}" = "124" ] || [ "${code:-0}" = "137" ]; then
+            echo "정상: 55분 타임아웃으로 상주 루프 종료"
+            exit 0
+          fi
+          exit ${code:-0}
+      - name: Persist state
+        if: always()   # 타임아웃/실패여도 오프셋·마커·응답 상태를 반드시 커밋 (중복 방지)
+        run: |
+          git config user.name "sentiment-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state/ 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "state: ${{ steps.mode.outputs.mode }} $(date -u '+%F %T')"
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push || true
+          fi
+      - name: Failure alert
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="⚠️ sentiment-bot 실행 실패 (mode: ${{ steps.mode.outputs.mode }}, run: ${{ github.run_id }})" > /dev/null
