@@ -9,79 +9,39 @@
 #
 # ⚠️ Public repo 전제 (Actions 무제한). Private면 월 2,000분 한도를 이틀 만에 소진.
 #
+# 재발 방지 3중 안전장치 (2026-08 좀비 런 사태 이후):
+#   1) 스케줄 기동은 cancel-in-progress → 좀비 런을 죽이고 슬롯 확보
+#      (수동 긴급 진단은 기존대로 직렬화 유지 — 상주 루프를 죽이지 않음)
+#   2) timeout-minutes: 57 → GitHub 레벨 강제 종료
+#   3) timeout 3300 (55분) → OS 레벨 프로세스 강제 종료 (최후 보루)
+#      · 124/137 종료는 정상으로 간주 → 실패 알림 스팸 방지, state 커밋 시간 확보
+#
 # Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY(무료),
 #          DIGEST_REPO/GH_PAT(선택), FRED_API_KEY(선택)
 #
 # 긴급 전체 진단: Actions → Run workflow (--weekly로 즉시 진단 후 종료,
 #                대기 중인 상주 인스턴스와는 concurrency로 직렬화)
-
 name: market-sentiment-bot
-
 on:
   schedule:
     - cron: '0 * * * *'      # 매시 정각 상주 기동 (정기작업은 내부 시계가 발동)
   workflow_dispatch:          # 긴급: 즉시 전체 진단
-
 permissions:
   contents: write   # state/ 커밋용
-
 concurrency:
   group: sentiment-bot
-  cancel-in-progress: false
-
+  # 스케줄 기동(true): 이전 좀비 런을 자동 취소하고 새로 상주
+  # 수동 기동(false): 상주 루프를 죽이지 않고 뒤에 줄 서서 직렬 실행
+  cancel-in-progress: ${{ github.event_name == 'schedule' }}
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 58
+    timeout-minutes: 57
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
-
       - name: Install deps
-        run: pip install -q -r requirements.txt
-
-      - name: Determine mode
-        id: mode
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="weekly"     # 긴급 수동 = 즉시 전체 진단 후 종료
-          else
-            MODE="loop"       # 정각 크론 = 55분 상주
-          fi
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "실행 모드: $MODE"
-
-      - name: Run sentiment bot
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          DIGEST_REPO: ${{ secrets.DIGEST_REPO }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-          ANSWER_WAIT_MIN: '5'    # 진단 발송 후 답장 대기(분) — 상주라 놓쳐도 즉시 회수됨
-          LOOP_MINUTES: '55'
-        run: python sentiment_bot.py --${{ steps.mode.outputs.mode }}
-
-      - name: Persist state
-        if: always()   # 타임아웃/실패여도 오프셋·마커·응답 상태를 반드시 커밋 (중복 방지)
-        run: |
-          git config user.name "sentiment-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add state/ 2>/dev/null || true
-          if ! git diff --cached --quiet; then
-            git commit -m "state: ${{ steps.mode.outputs.mode }} $(date -u '+%F %T')"
-            git pull --rebase --autostash origin ${{ github.ref_name }} || true
-            git push || true
-          fi
-
-      - name: Failure alert
-        if: failure()
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d text="⚠️ sentiment-bot 실행 실패 (mode: ${{ steps.mode.outputs.mode }}, run: ${{ github.run_id }})" > /dev/null
+        run: pip install -q -r
